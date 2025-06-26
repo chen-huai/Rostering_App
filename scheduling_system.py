@@ -283,54 +283,86 @@ def assign_daily_groups(staff_df, calendar_df, daily_group_size=5, supplement_gr
 
             # 如果是节假日后第一天，则需要安排增补组
             if calendar_df.loc[day_idx, '节假日后第一天']:
-                # --- v5: 组合限制规则 ---
-                supp_candidates_pool = staff_task_count[~staff_task_count['人员名称'].isin(daily_group_members)].copy()
-                supplement_group_df = pd.DataFrame()
+                print(f"\n为 {calendar_df.loc[day_idx, '日期格式化']} 分配增补组:")
+                supplement_group = []
+                daily_group_members = daily_group_members_df['人员名称'].tolist()
+
+                # 候选人池: 排除日常组成员
+                candidates_pool = staff_task_count[~staff_task_count['人员名称'].isin(daily_group_members)].copy()
                 
-                # 获取日常组的组构成
-                daily_team_groups = daily_group_members_df['小组'].value_counts().to_dict()
+                # 日常组的组构成
+                daily_groups_dict = daily_group_members_df['小组'].value_counts().to_dict()
 
-                for _ in range(supplement_group_size):
-                    if supp_candidates_pool.empty:
-                        print(f"警告: 增补组候选人不足，无法选出 {supplement_group_size} 人。")
+                for i in range(supplement_group_size):
+                    if candidates_pool.empty:
+                        print(f"  警告: 候选人池为空，无法选择第 {i+1} 名增补组成员。")
                         break
-                    
-                    # 确定合格候选人
-                    eligible_indices = []
+
+                    # --- 优先级 1: 绝对公平 ---
+                    # 只选择增补次数最少的人员
+                    min_supp_count = candidates_pool['增补次数'].min()
+                    pool_p1 = candidates_pool[candidates_pool['增补次数'] == min_supp_count].copy()
+                    print(f"  选择第 {i+1} 人: 最小增补次数为 {min_supp_count} 的有 {len(pool_p1)} 人")
+
+                    # --- 优先级 2: 同组人员不超过2人 ---
+                    pool_p2_indices = []
                     # 获取已选增补人员的组构成
-                    supp_team_groups = supplement_group_df['小组'].value_counts().to_dict() if not supplement_group_df.empty else {}
-
-                    for idx, cand in supp_candidates_pool.iterrows():
+                    supplement_groups_dict = {}
+                    if supplement_group:
+                        supp_df = staff_task_count[staff_task_count['人员名称'].isin(supplement_group)]
+                        supplement_groups_dict = supp_df['小组'].value_counts().to_dict()
+                    
+                    for idx, cand in pool_p1.iterrows():
                         cand_group = cand['小组']
-                        # 计算如果选上该候选人，其所在小组的总人数
-                        total_from_group = daily_team_groups.get(cand_group, 0) + supp_team_groups.get(cand_group, 0)
-                        # 规则: 同组总人数不能超过2人
-                        if total_from_group < 2:
-                            eligible_indices.append(idx)
+                        total_in_group = daily_groups_dict.get(cand_group, 0) + supplement_groups_dict.get(cand_group, 0)
+                        if total_in_group < 2:
+                            pool_p2_indices.append(idx)
                     
-                    # 优先从合格者中选，如果没有则打破规则
-                    if eligible_indices:
-                        selection_pool = supp_candidates_pool.loc[eligible_indices]
+                    if pool_p2_indices:
+                        selection_pool = pool_p1.loc[pool_p2_indices]
+                        print(f"    -> P2: 找到 {len(selection_pool)} 人符合'同组<2人'规则")
                     else:
-                        print(f"警告: 为满足增补组人数，将打破'日常组+增补组同组人员不超过2人'的限制。")
-                        selection_pool = supp_candidates_pool
+                        # 为保证公平性，必须打破"同组<2人"的规则
+                        print(f"    -> P2: 警告! 为保证公平，将打破'同组<2人'规则")
+                        selection_pool = pool_p1
 
-                    # 从确定的池中，选择增补次数最少的一位
-                    best_candidate = selection_pool.sort_values(by='增补次数', ascending=True).head(1)
+                    # --- 优先级 3: 尽可能选择不同组 ---
+                    used_subgroups = set(daily_groups_dict.keys()) | set(supplement_groups_dict.keys())
                     
-                    # 添加到增补组并从候选池中移除
-                    supplement_group_df = pd.concat([supplement_group_df, best_candidate])
-                    supp_candidates_pool = supp_candidates_pool.drop(best_candidate.index[0])
+                    pool_p3 = selection_pool[~selection_pool['小组'].isin(used_subgroups)]
+                    
+                    if not pool_p3.empty:
+                        final_selection_pool = pool_p3
+                        print(f"    -> P3: 找到 {len(final_selection_pool)} 人来自不同小组")
+                    else:
+                        final_selection_pool = selection_pool
+                        print(f"    -> P3: 无不同小组可选，从P2结果中选择")
+                        
+                    # --- 最终选择 ---
+                    # 从最终候选池中随机选择一个
+                    if final_selection_pool.empty:
+                        print("    错误: 无法在所有限制下找到候选人，请检查逻辑")
+                        continue
+                        
+                    best_candidate = final_selection_pool.sample(1)
+                    selected_person_name = best_candidate.iloc[0]['人员名称']
+                    selected_person_idx = best_candidate.index[0]
 
-                # 更新增补组信息和次数统计
-                if not supplement_group_df.empty:
-                    supplement_group = supplement_group_df['人员名称'].tolist()
+                    # 添加到增补组
+                    supplement_group.append(selected_person_name)
+
+                    # 立即更新此人的统计数据
+                    staff_task_count.loc[selected_person_idx, '增补次数'] += 1
+                    staff_task_count.loc[selected_person_idx, '节假日后一天'] += 1
+
+                    # 从本轮候选池中移除，以便下一位增补成员的选择
+                    candidates_pool = candidates_pool.drop(selected_person_idx)
+                    print(f"    -> 已选择: {selected_person_name} (小组: {best_candidate.iloc[0]['小组']})")
+
+
+                # 在日历中记录最终的增补组
+                if supplement_group:
                     calendar_df.loc[day_idx, '增补组'] = '; '.join(supplement_group)
-
-                    for name in supplement_group:
-                        staff_idx = staff_task_count.index[staff_task_count['人员名称'] == name]
-                        staff_task_count.loc[staff_idx, '增补次数'] += 1
-                        staff_task_count.loc[staff_idx, '节假日后一天'] += 1
 
         # --- 3. 更新本次日常组成员的统计数据 ---
         for name in daily_group_members:
@@ -352,6 +384,16 @@ def assign_daily_groups(staff_df, calendar_df, daily_group_size=5, supplement_gr
     print(f"日常排班次数范围: {min_daily} - {max_daily}")
     if max_daily - min_daily > 1:
         print(f"警告: 日常排班次数差距为 {max_daily-min_daily}，大于1。可考虑重新引入平衡函数。")
+
+    max_supp = staff_task_count['增补次数'].max()
+    min_supp = staff_task_count['增补次数'].min()
+    print(f"增补排班次数范围: {min_supp} - {max_supp}")
+    if max_supp - min_supp > 1:
+        print(f"警告: 增补排班次数差距为 {max_supp - min_supp}，大于1")
+    print("增补次数分布:")
+    supp_distribution = staff_task_count['增补次数'].value_counts().sort_index()
+    for count, num in supp_distribution.items():
+        print(f"  增补次数 {count}: {num} 人")
 
     print("\n各人员排班次数详情:")
     for _, row in staff_task_count.sort_values(by=['小组', '人员名称']).iterrows():
@@ -404,6 +446,59 @@ def export_updated_staff(staff_df, output_file):
     staff_df.to_excel(output_file, index=False)
     print(f"更新后的人员信息已导出到: {output_file}")
     return staff_df
+
+
+def assign_supplement_group_fair_and_group(staff_task_count, daily_group_members_df, supplement_group_size, super_cycle_unassigned):
+    """
+    增补组分配：
+    1. 绝对优先保证增补次数公平（最大-最小≤1）
+    2. 在公平基础上，优先保证日常+增补同组不超过2人
+    3. 在此基础上优先选本大周期未分配日常组的人员
+    4. 若都无法满足，打破同组限制但仍保证公平
+    """
+    supplement_group = []
+    supplement_group_df = pd.DataFrame()
+    # 获取日常组的组构成
+    daily_team_groups = daily_group_members_df['小组'].value_counts().to_dict()
+    # 候选池：排除日常组成员
+    candidates = staff_task_count[~staff_task_count['人员名称'].isin(daily_group_members_df['人员名称'])].copy()
+    for i in range(supplement_group_size):
+        if candidates.empty:
+            print(f"  警告: 增补组候选人池为空，无法选择第{i+1}名成员")
+            break
+        # 1. 只保留增补次数最少的候选人
+        min_supp = candidates['增补次数'].min()
+        fair_candidates = candidates[candidates['增补次数'] == min_supp].copy()
+        # 2. 在这些人中，优先保证日常+增补同组不超过2人
+        supp_team_groups = supplement_group_df['小组'].value_counts().to_dict() if not supplement_group_df.empty else {}
+        eligible_indices = []
+        for idx, cand in fair_candidates.iterrows():
+            cand_group = cand['小组']
+            total_from_group = daily_team_groups.get(cand_group, 0) + supp_team_groups.get(cand_group, 0)
+            if total_from_group < 2:
+                eligible_indices.append(idx)
+        if eligible_indices:
+            group_ok_candidates = fair_candidates.loc[eligible_indices]
+        else:
+            group_ok_candidates = fair_candidates
+        # 3. 优先选本大周期未分配日常组的
+        unassigned_candidates = group_ok_candidates[group_ok_candidates['人员名称'].isin(super_cycle_unassigned)]
+        if not unassigned_candidates.empty:
+            selection_pool = unassigned_candidates
+        else:
+            selection_pool = group_ok_candidates
+        # 4. 随机选一个
+        selected_person = selection_pool.sample(1).iloc[0]['人员名称']
+        supplement_group.append(selected_person)
+        # 立即更新该人员的增补次数
+        staff_idx = staff_task_count.index[staff_task_count['人员名称'] == selected_person][0]
+        staff_task_count.loc[staff_idx, '增补次数'] += 1
+        # 添加到已选df
+        supplement_group_df = pd.concat([supplement_group_df, staff_task_count.loc[[staff_idx]]])
+        # 从候选池移除
+        candidates = candidates.drop(staff_idx)
+        print(f"    选择增补组成员 {i+1}: {selected_person} (增补次数: {min_supp} -> {min_supp + 1})")
+    return supplement_group
 
 
 def main():
